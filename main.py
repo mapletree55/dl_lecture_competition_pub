@@ -2,15 +2,17 @@ import re
 import random
 import time
 from statistics import mode
-
 from PIL import Image
 import numpy as np
-import pandas
+import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
-
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import requests
+import os
 
 def set_seed(seed):
     random.seed(seed)
@@ -21,11 +23,9 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 def process_text(text):
-    # lowercase
+    #lower case
     text = text.lower()
-
     # 数詞を数字に変換
     num_word_to_digit = {
         'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
@@ -34,13 +34,10 @@ def process_text(text):
     }
     for word, digit in num_word_to_digit.items():
         text = text.replace(word, digit)
-
     # 小数点のピリオドを削除
     text = re.sub(r'(?<!\d)\.(?!\d)', '', text)
-
     # 冠詞の削除
     text = re.sub(r'\b(a|an|the)\b', '', text)
-
     # 短縮形のカンマの追加
     contractions = {
         "dont": "don't", "isnt": "isn't", "arent": "aren't", "wont": "won't",
@@ -48,51 +45,44 @@ def process_text(text):
     }
     for contraction, correct in contractions.items():
         text = text.replace(contraction, correct)
-
     # 句読点をスペースに変換
     text = re.sub(r"[^\w\s':]", ' ', text)
-
     # 句読点をスペースに変換
     text = re.sub(r'\s+,', ',', text)
-
     # 連続するスペースを1つに変換
     text = re.sub(r'\s+', ' ', text).strip()
-
     return text
-
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
-        self.transform = transform  # 画像の前処理
-        self.image_dir = image_dir  # 画像ファイルのディレクトリ
-        self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
+    def __init__(self, df_path, image_dir, transform=None, answer=True, max_length=50, class_mapping_path=None):
+        self.transform = transform # 画像の前処理
+        self.image_dir = image_dir # 画像ファイルのディレクトリ
+        self.df = pd.read_json(df_path) # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
-
-        # question / answerの辞書を作成
-        self.question2idx = {}
+        self.max_length = max_length
+        self.df["question"] = self.df["question"].apply(process_text)
+        # Kerasのトークナイザーを使用して質問文をシーケンス化し、パディングを行うことで次元を揃える。
+        self.tokenizer = Tokenizer()
+        self.tokenizer.fit_on_texts(self.df["question"])
+        self.sequences = self.tokenizer.texts_to_sequences(self.df["question"])
+        self.padded_sequences = pad_sequences(self.sequences, maxlen=self.max_length, padding='post')
+        self.vocab_size = len(self.tokenizer.word_index) + 1
         self.answer2idx = {}
-        self.idx2question = {}
         self.idx2answer = {}
 
-        # 質問文に含まれる単語を辞書に追加
-        for question in self.df["question"]:
-            question = process_text(question)
-            words = question.split(" ")
-            for word in words:
-                if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
+        if class_mapping_path:
+            class_mapping = pd.read_csv(class_mapping_path)
+            self.answer2idx = {row['answer']: row['class_id'] for _, row in class_mapping.iterrows()}
+            self.idx2answer = {row['class_id']: row['answer'] for _, row in class_mapping.iterrows()}
 
         if self.answer:
-            # 回答に含まれる単語を辞書に追加
             for answers in self.df["answers"]:
                 for answer in answers:
-                    word = answer["answer"]
-                    word = process_text(word)
+                    word = process_text(answer["answer"])
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
-            self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+            self.idx2answer = {v: k for k, v in self.answer2idx.items()}
 
     def update_dict(self, dataset):
         """
@@ -103,10 +93,10 @@ class VQADataset(torch.utils.data.Dataset):
         dataset : Dataset
             訓練データのDataset
         """
-        self.question2idx = dataset.question2idx
+        self.tokenizer = dataset.tokenizer
         self.answer2idx = dataset.answer2idx
-        self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
+        self.vocab_size = dataset.vocab_size
 
     def __getitem__(self, idx):
         """
@@ -121,8 +111,6 @@ class VQADataset(torch.utils.data.Dataset):
         -------
         image : torch.Tensor  (C, H, W)
             画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文をone-hot表現に変換したもの
         answers : torch.Tensor  (n_answer)
             10人の回答者の回答のid
         mode_answer_idx : torch.Tensor  (1)
@@ -130,32 +118,21 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
-
+        question = torch.tensor(self.padded_sequences[idx], dtype=torch.long)
         if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+            answers = [self.answer2idx.get(process_text(answer["answer"]), -1) for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
-
+            return image, question, torch.tensor(answers, dtype=torch.long), int(mode_answer_idx)
         else:
-            return image, torch.Tensor(question)
+            return image, question
 
     def __len__(self):
         return len(self.df)
-
 
 # 2. 評価指標の実装
 # 簡単にするならBCEを利用する
 def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
     total_acc = 0.
-
     for pred, answers in zip(batch_pred, batch_answers):
         acc = 0.
         for i in range(len(answers)):
@@ -167,48 +144,37 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
                     num_match += 1
             acc += min(num_match / 3, 1)
         total_acc += acc / 10
-
     return total_acc / len(batch_pred)
-
 
 # 3. モデルのの実装
 # ResNetを利用できるようにしておく
 class BasicBlock(nn.Module):
     expansion = 1
-
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
-
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
-
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
                 nn.BatchNorm2d(out_channels)
             )
-
     def forward(self, x):
         residual = x
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-
         out += self.shortcut(residual)
         out = self.relu(out)
-
         return out
-
 
 class BottleneckBlock(nn.Module):
     expansion = 4
-
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
-
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1)
@@ -216,172 +182,145 @@ class BottleneckBlock(nn.Module):
         self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, stride=1)
         self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
         self.relu = nn.ReLU(inplace=True)
-
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels * self.expansion:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride),
                 nn.BatchNorm2d(out_channels * self.expansion)
             )
-
     def forward(self, x):
         residual = x
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.relu(self.bn2(self.conv2(out)))
         out = self.bn3(self.conv3(out))
-
         out += self.shortcut(residual)
         out = self.relu(out)
-
         return out
-
 
 class ResNet(nn.Module):
     def __init__(self, block, layers):
         super().__init__()
         self.in_channels = 64
-
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
         self.layer1 = self._make_layer(block, layers[0], 64)
         self.layer2 = self._make_layer(block, layers[1], 128, stride=2)
         self.layer3 = self._make_layer(block, layers[2], 256, stride=2)
         self.layer4 = self._make_layer(block, layers[3], 512, stride=2)
-
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, 512)
-
+        self.fc = nn.Linear(512 * block.expansion, 2048)
     def _make_layer(self, block, blocks, out_channels, stride=1):
         layers = []
         layers.append(block(self.in_channels, out_channels, stride))
         self.in_channels = out_channels * block.expansion
         for _ in range(1, blocks):
             layers.append(block(self.in_channels, out_channels))
-
         return nn.Sequential(*layers)
-
     def forward(self, x):
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
-
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
-
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
-
         return x
-
-
-def ResNet18():
-    return ResNet(BasicBlock, [2, 2, 2, 2])
-
 
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
-
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, vocab_size: int, n_answer: int, embedding_dim: int = 128):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
-
+        self.resnet = ResNet50()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.text_encoder = nn.LSTM(embedding_dim, 512, batch_first=True)
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(2048 + 512, 512),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
             nn.Linear(512, n_answer)
         )
-
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
-
+        image_feature = self.resnet(image) # 画像の特徴量
+        embedded_question = self.embedding(question)
+        _, (hidden, _) = self.text_encoder(embedded_question)
+        question_feature = hidden[-1] # テキストの特徴量
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
-
         return x
 
+from tqdm import tqdm
 
 # 4. 学習の実装
 def train(model, dataloader, optimizer, criterion, device):
     model.train()
-
     total_loss = 0
     total_acc = 0
     simple_acc = 0
-
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
+    for image, question, answers, mode_answer in tqdm(dataloader, desc="Training"):
+        image, question, answers, mode_answer = image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
         pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
-
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
         total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
-
+        total_acc += VQA_criterion(pred.argmax(1), answers)
+        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
-
-def eval(model, dataloader, optimizer, criterion, device):
+def eval(model, dataloader, criterion, device):
     model.eval()
-
     total_loss = 0
     total_acc = 0
     simple_acc = 0
-
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
+    for image, question, answers, mode_answer in tqdm(dataloader, desc="Evaluating"):
+        image, question, answers, mode_answer = image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
         pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
-
         total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).mean().item()  # simple accuracy
-
+        total_acc += VQA_criterion(pred.argmax(1), answers) # VQA accuracy
+        simple_acc += (pred.argmax(1) == mode_answer).mean().item() # simple accuracy
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
-
 
 def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    class_mapping_path = "class_mapping.csv"
+    if not os.path.exists(class_mapping_path):
+        url = "https://huggingface.co/spaces/CVPR/VizWiz-CLIP-VQA/raw/main/data/annotations/class_mapping.csv"
+        r = requests.get(url)
+        with open(class_mapping_path, 'wb') as f:
+            f.write(r.content)
     # dataloader / model
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    train_dataset = VQADataset(df_path="content/data/train.json", image_dir="content/data/train", transform=transform, class_mapping_path=class_mapping_path)
+    test_dataset = VQADataset(df_path="content/data/valid.json", image_dir="content/data/valid", transform=transform, answer=False, class_mapping_path=class_mapping_path)
     test_dataset.update_dict(train_dataset)
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
-
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(vocab_size=train_dataset.vocab_size, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
     num_epoch = 20
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
     # train model
     for epoch in range(num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
@@ -390,16 +329,14 @@ def main():
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
-
+        scheduler.step()
     # 提出用ファイルの作成
-    model.eval()
     submission = []
     for image, question in test_loader:
         image, question = image.to(device), question.to(device)
         pred = model(image, question)
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
-
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
